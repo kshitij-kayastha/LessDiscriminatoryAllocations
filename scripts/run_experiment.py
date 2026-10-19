@@ -8,6 +8,7 @@ paths match the notebook exactly, so results are interchangeable with a notebook
 """
 
 import argparse
+import ast
 import json
 import sys
 import time
@@ -38,6 +39,12 @@ def main():
     # The notebook never seeds the cohort draw, so repeat runs see different cohorts.
     # Seeding by default makes a run reproducible; pass -1 for the notebook's behaviour.
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--people-file",
+                    help="reuse cohorts from an earlier run's people_*.csv instead of drawing them, "
+                         "so two runs can be compared cohort by cohort")
+    ap.add_argument("--cohort-label", default="shared",
+                    help="marker added to the output filenames when --people-file is used, "
+                         "so these results sit beside rather than overwrite the originals")
     ap.add_argument("--skip-existing", action="store_true",
                     help="exit immediately if the comparison CSV already exists")
     args = ap.parse_args()
@@ -50,6 +57,8 @@ def main():
     GROUP_COLUMN = args.group_column
 
     tag = f"{method}_y-{QUALIFICATION_COLUMN}_rate-{SELECTION_RATE}_size-{TEST_SIZE}"
+    if args.people_file:
+        tag += f"_cohorts-{args.cohort_label}"
     fp_input = ROOT / "data/obermeyer/obermeyer_data_cleaned.csv"
     fp_predictions = ROOT / f"data/predictions/{method}_{QUALIFICATION_COLUMN}.csv"
     fp_output_opt = ROOT / f"data/results/allocations/opt_tru_need_{tag}.csv"
@@ -92,7 +101,13 @@ def main():
         NUM_MODELS=args.num_models,
         ITERATIONS_PER_SPLIT=args.iterations_per_split,
     )
-    allocations_opt, allocations_lda, people = a.get_allocations()
+    people_source = None
+    if args.people_file:
+        people_source = pd.read_csv(args.people_file)
+        people_source["people"] = people_source["people"].apply(ast.literal_eval)
+        print(f"reusing {len(people_source)} cohorts from {args.people_file}", flush=True)
+
+    allocations_opt, allocations_lda, people = a.get_allocations(people_source=people_source)
     print(f"{len(people)} cohorts, {TEST_SIZE} people per cohort, k = {a.k}", flush=True)
 
     for fp in (fp_output_opt, fp_output_lda, fp_output_people, fp_output):

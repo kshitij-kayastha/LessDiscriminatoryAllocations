@@ -56,11 +56,61 @@ On macOS, wrap the sweep in `caffeinate` so idle sleep cannot stall it:
 nohup caffeinate -is bash scripts/run_all.sh > logs/run_all.log 2>&1 &
 ```
 
-## Seeding
+## Seeding, and reusing cohorts
 
 `--seed` defaults to `0`, which seeds NumPy before cohort sampling and makes a
 run reproducible. Pass `--seed=-1` for the notebook's behaviour, where each run
 draws different cohorts.
+
+Because the notebook never seeded the draw, two runs of the same configuration
+see different people and cannot be compared cohort by cohort. To put two runs on
+identical cohorts, point the second at the first run's `people_*.csv`:
+
+```bash
+uv run python scripts/run_experiment.py \
+    --selection-rate 0.25 --qualification-column qualified_gagne_1 \
+    --people-file data/cohorts/people_..._rate-0.25_size-250.csv \
+    --cohort-label kshitij
+```
+
+`--cohort-label` is added to the output filenames, so these results sit beside
+the originals rather than overwriting them. The run fails loudly if a cohort is
+missing, is the wrong size, or names a person absent from that split.
+
+## Metrics from saved allocations
+
+`scripts/compute_metrics.py` derives further metrics from
+`data/results/allocations/` without re-running anything — a sweep takes about ten
+seconds across all nine configurations.
+
+```bash
+uv run python scripts/compute_metrics.py --self-test   # check the maths
+uv run python scripts/compute_metrics.py               # write diversity_*.csv
+```
+
+Allocations are expanded per model first: a row in the allocation files is one
+*distinct* selection, and its `models` column says how many models produced it,
+so a selection found by 40 models counts 40 times. That makes `p` a per-person
+selection probability and matches "two random allocations from the set".
+
+| Metric | Meaning |
+|---|---|
+| `pairwise_difference` | Mean symmetric difference between two allocations, scaled to [0, 1]. 0 = identical, 1 = disjoint |
+| `pairwise_consistency` | Share of people given the same outcome by two random allocations. The paper's homogenization measure |
+| `heterozygosity` | Mean of 2p(1−p) over people |
+| `selection_entropy` | Mean binary Shannon entropy of p, in bits |
+| `share_chance_ge_10pct` | Fraction of the cohort selected by at least 10% of models |
+| `systemic_exclusion_all` | Fraction of the cohort selected by no model |
+| `systemic_exclusion_qualified` | Same, among qualified people only — the quantity the paper reports |
+
+The last two differ: `metrics.py:57` divides by everyone, while the paper's
+10–30% figure is among the qualified. Both are kept so they are not confused.
+
+**Uniqueness is not diversity.** `num_unique_allocations` counts selections that
+differ at all, so two allocations differing in one person count as two. Every
+measure above instead asks *how far apart* they are, and the two disagree: the DP
+produces fewer unique allocations than top-k in 8 of 9 configurations, but scores
+better on every diversity measure in 9 of 9.
 
 ## Measured runtimes
 

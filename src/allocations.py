@@ -195,21 +195,54 @@ class Allocations:
             seed, iteration, df, perf, needs=rounded_needs,
         )
 
-    def get_allocations(self, expected_need_column=None, eta=0.1, need_bound=None):
+    def get_allocations(self, expected_need_column=None, eta=0.1, need_bound=None, people_source=None):
+        """Run both allocators over every cohort.
+
+        By default each cohort is drawn here. Pass `people_source` -- a DataFrame
+        with seed, iteration and people (a list of person_ids) -- to reuse cohorts
+        from an earlier run instead, so two runs can be compared cohort by cohort.
+        """
+        cohorts = None
+        if people_source is not None:
+            cohorts = {
+                (int(r["seed"]), int(r["iteration"])): list(r["people"])
+                for _, r in people_source.iterrows()
+            }
+
         allocations_opt = []
         allocations_lda = []
         people = []
         for split in range(self.NUM_SPLITS):
             split_df = self.df[(self.df["seed"]==split)&(self.df["person_id"]>=0)].copy()
             perf_df = self.df[(self.df["seed"]==split)&(self.df["person_id"]<0)].copy()
-        
+
             for i in tqdm(range(self.ITERATIONS_PER_SPLIT), desc=f"[Split {split}]"):
-                k_0 = np.random.choice(range(1, self.TEST_SIZE))
-                k_1 = self.TEST_SIZE - k_0
-                sample_0 = split_df[split_df[self.GROUP_COLUMN]==0].sample(n=k_0, random_state=i)
-                sample_1 = split_df[split_df[self.GROUP_COLUMN]==1].sample(n=k_1, random_state=i)
-                people_sample = pd.concat((sample_0, sample_1)).sample(frac=1, ignore_index=True)
-                # people_sample = split_df.sample(n=self.TEST_SIZE, random_state=i)
+                if cohorts is not None:
+                    if (split, i) not in cohorts:
+                        raise KeyError(f"people_source has no cohort for seed {split}, iteration {i}")
+                    ids = cohorts[(split, i)]
+                    if len(ids) != self.TEST_SIZE:
+                        raise ValueError(
+                            f"cohort (seed {split}, iteration {i}) holds {len(ids)} people, "
+                            f"but TEST_SIZE is {self.TEST_SIZE}"
+                        )
+                    indexed = split_df.set_index("person_id")
+                    missing = [p for p in ids if p not in indexed.index]
+                    if missing:
+                        raise KeyError(
+                            f"cohort (seed {split}, iteration {i}) names {len(missing)} person_ids "
+                            f"absent from this split, e.g. {missing[:5]}"
+                        )
+                    # .loc keeps the given order; reset_index restores the 0..n-1
+                    # index the allocators rely on.
+                    people_sample = indexed.loc[ids].reset_index()
+                else:
+                    k_0 = np.random.choice(range(1, self.TEST_SIZE))
+                    k_1 = self.TEST_SIZE - k_0
+                    sample_0 = split_df[split_df[self.GROUP_COLUMN]==0].sample(n=k_0, random_state=i)
+                    sample_1 = split_df[split_df[self.GROUP_COLUMN]==1].sample(n=k_1, random_state=i)
+                    people_sample = pd.concat((sample_0, sample_1)).sample(frac=1, ignore_index=True)
+                    # people_sample = split_df.sample(n=self.TEST_SIZE, random_state=i)
                 people.append({"seed": split, "iteration": i, "people": people_sample["person_id"].to_list()})
                 
                 allocations_opt += self.calculate_rashomon_allocations(split, i, people_sample, perf_df)
