@@ -10,3 +10,5 @@ wheels/
 .venv
 
 data/
+logs/
+.DS_Store
