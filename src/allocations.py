@@ -233,6 +233,8 @@ class Allocations:
                         eta=eta,
                         need_bound=need_bound,
                     )
+                else:
+                    allocations_lda_exp = []
         people = pd.DataFrame(people)
         allocations_opt = pd.DataFrame(allocations_opt)
         allocations_lda_tru = pd.DataFrame(allocations_lda_tru)
