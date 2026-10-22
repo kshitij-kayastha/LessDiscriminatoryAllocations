@@ -77,29 +77,52 @@ def cohort_metrics(selected_lists, people_ids, qualified_mask):
     }
 
 
+def allocation_files(people_fp):
+    """The allocation files beside a people_*.csv, labelled by allocator.
+
+    Two layouts exist. The true-needs runs wrote opt_tru_need_X / lda_tru_need_X
+    beside people_tru_need_X; the multiclass runs write opt_M / lda_tru_need_M /
+    lda_exp_need_M beside people_M. Stripping only the "people_" prefix makes one
+    rule cover both.
+    """
+    tag = Path(people_fp).name[len("people_"):-len(".csv")]
+    candidates = {
+        "OPT": f"opt_{tag}.csv",
+        "LDA": f"lda_{tag}.csv",              # the old single-allocator layout
+        "LDA_TRU": f"lda_tru_need_{tag}.csv",
+        "LDA_EXP": f"lda_exp_need_{tag}.csv",
+    }
+    found = {}
+    for label, name in candidates.items():
+        fp = Path(people_fp).with_name(name)
+        if fp.exists():
+            found[label] = fp
+    return tag, found
+
+
 def run_config(people_fp, qual_column_cache):
-    tag = Path(people_fp).name[len("people_tru_need_"):-len(".csv")]
-    opt_fp = Path(people_fp).with_name(f"opt_tru_need_{tag}.csv")
-    lda_fp = Path(people_fp).with_name(f"lda_tru_need_{tag}.csv")
-    if not (opt_fp.exists() and lda_fp.exists()):
-        print(f"  skip {tag}: missing opt/lda files", flush=True)
+    tag, found = allocation_files(people_fp)
+    if "OPT" not in found or len(found) < 2:
+        print(f"  skip {tag}: found only {sorted(found)}", flush=True)
         return None
 
     qual = re.search(r"y-(qualified_gagne_\d)", tag).group(1)
-    if qual not in qual_column_cache:
-        pred = pd.read_csv(ROOT / f"data/predictions/test_bootstrap_nn_{qual}.csv",
+    method = re.search(r"(test_bootstrap[a-z_]*?nn)_y-", tag).group(1)
+    key = (method, qual)
+    if key not in qual_column_cache:
+        pred = pd.read_csv(ROOT / f"data/predictions/{method}_{qual}.csv",
                            usecols=["person_id", "seed", "y"])
         pred = pred[pred["person_id"] >= 0]
-        qual_column_cache[qual] = {
+        qual_column_cache[key] = {
             s: dict(zip(g["person_id"], g["y"])) for s, g in pred.groupby("seed")
         }
-    y_by_seed = qual_column_cache[qual]
+    y_by_seed = qual_column_cache[key]
 
     people = pd.read_csv(people_fp)
     people["people"] = people["people"].apply(ast.literal_eval)
 
     rows = []
-    for algorithm, fp in (("OPT", opt_fp), ("LDA", lda_fp)):
+    for algorithm, fp in sorted(found.items()):
         alloc = pd.read_csv(fp)
         alloc["selected"] = alloc["selected"].apply(ast.literal_eval)
         alloc["models"] = alloc["models"].apply(ast.literal_eval)
@@ -153,7 +176,7 @@ def self_test():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
-    ap.add_argument("--pattern", default="people_tru_need_*.csv")
+    ap.add_argument("--pattern", default="people_*.csv")
     args = ap.parse_args()
 
     if args.self_test:
