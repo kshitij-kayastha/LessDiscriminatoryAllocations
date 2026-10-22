@@ -18,20 +18,32 @@ class Allocations:
         self.NUM_SPLITS = len(self.df["seed"].unique())
         self.ITERATIONS_PER_SPLIT = ITERATIONS_PER_SPLIT
 
-    def calculate_rashomon_allocations(self, seed, iteration, df, perf):
-        best_perf = 1
-        for model in range(1, self.NUM_MODELS+1):
-            model_perf = float(perf.loc[perf["person_id"]==-1, "m_"+str(model)].item())
-            best_perf = min(best_perf, model_perf)
+    def _eligible_models(self, perf):
+        names = [f"m_{i}" for i in range(1, self.NUM_MODELS + 1)]
+        rows = perf.loc[perf["person_id"] == -1, names]
+        if len(rows) != 1:
+            raise ValueError("Expected exactly one validation-loss row per split")
+        losses = rows.iloc[0].astype(float)
+        if not np.isfinite(losses).all():
+            raise ValueError("Validation losses must be finite")
+        return losses.index[losses <= losses.min() + self.RASHOMON_EPSILON].tolist()
 
+    @staticmethod
+    def expected_need_column_for_model(model_name, expected_need_column="expected_need_{model}"):
+        if not isinstance(expected_need_column, str) or not expected_need_column:
+            raise ValueError("expected_need_column must be a column name or template")
+        try:
+            return expected_need_column.format(model=model_name)
+        except (KeyError, ValueError, IndexError) as error:
+            raise ValueError("Use {model} as the placeholder, e.g. expected_need_{model}") from error
+
+    def calculate_rashomon_allocations(self, seed, iteration, df, perf):
         allocations = {}
         allocation_data = []
         allocation_idx = 0
-        for model in range(1, self.NUM_MODELS+1):
-            if float(perf.loc[perf["person_id"]==-1, "m_"+str(model)].item()) > best_perf + self.RASHOMON_EPSILON:
-                continue
+        for model_name in self._eligible_models(perf):
 
-            selected_idx = df["m_"+str(model)].nlargest(self.k).index.to_list()
+            selected_idx = df[model_name].nlargest(self.k).index.to_list()
             k_prime = int(df.loc[selected_idx, self.QUALIFICATION_COLUMN].sum())
             n_prime = int(df[self.QUALIFICATION_COLUMN].sum())
             selected_people = df.loc[selected_idx, "person_id"].to_list()
@@ -47,10 +59,10 @@ class Allocations:
 					"k'": k_prime,
 					"n'": n_prime,
 				})
-                allocations[allocation] = {"allocation_idx": allocation_idx, "models": ["m_"+str(model)]}
+                allocations[allocation] = {"allocation_idx": allocation_idx, "models": [model_name]}
                 allocation_idx += 1
             else:
-                allocations[allocation]["models"].append("m_"+str(model))
+                allocations[allocation]["models"].append(model_name)
 
         models = {}
         for v in allocations.values():
@@ -76,36 +88,35 @@ class Allocations:
                         dp[count][new_sum] = (new_utility, previous[1] + (i, ))
         return dp
 
-    def calculate_least_discriminatory_allocation(self, seed, iteration, df, perf, needs=None):
-        """Run the DP using actual needs, or an explicitly supplied need Series."""
-        if needs is None:
+    def calculate_least_discriminatory_allocation(
+        self, seed, iteration, df, perf, needs=None, *, needs_by_model=None,
+    ):
+        if needs is not None and needs_by_model is not None:
+            raise ValueError("Pass either shared needs or needs_by_model, not both")
+        if needs is None and needs_by_model is None:
             needs = df[self.NEED_COLUMN]
-
-        best_perf = 1
-        for model in range(1, self.NUM_MODELS+1):
-            model_perf = float(perf.loc[perf["person_id"]==-1, "m_"+str(model)].item())
-            best_perf = min(best_perf, model_perf)
 
         allocations = {}
         allocation_data = []
         allocation_idx = 0
-        for model in range(1, self.NUM_MODELS+1):
-            if float(perf.loc[perf["person_id"]==-1, "m_"+str(model)].item()) > best_perf + self.RASHOMON_EPSILON:
-                continue
+        for model_name in self._eligible_models(perf):
 
-            probabilities = df["m_"+str(model)]
+            probabilities = df[model_name]
+            model_needs = needs if needs_by_model is None else needs_by_model[model_name]
+            if not model_needs.index.equals(df.index):
+                raise ValueError(f"Need values for {model_name} must align with the cohort index")
             tolerance = self.ALLOCATION_EPSILON
             group = df[self.GROUP_COLUMN]
             groups = [[i for i, label in group.items() if label == g] for g in (0, 1)]
             if not groups[0] or not groups[1]:
                 raise ValueError("There must be at least 1 individual in each group")
 
-            top_k_idx = df["m_"+str(model)].nlargest(self.k).index.to_list()
-            top_k_sum = df["m_"+str(model)].loc[top_k_idx].sum().item()
+            top_k_idx = df[model_name].nlargest(self.k).index.to_list()
+            top_k_sum = df[model_name].loc[top_k_idx].sum().item()
             utility_req = top_k_sum - self.k * tolerance
 
             tables = [
-                self.table_group(idx, probabilities, needs, min(len(idx), self.k-1))
+                self.table_group(idx, probabilities, model_needs, min(len(idx), self.k-1))
                 for idx in groups
             ]
 
@@ -150,10 +161,10 @@ class Allocations:
                     "k'": k_prime,
                     "n'": n_prime,
                 })
-                allocations[allocation] = {"allocation_idx": allocation_idx, "models": ["m_"+str(model)]}
+                allocations[allocation] = {"allocation_idx": allocation_idx, "models": [model_name]}
                 allocation_idx += 1
             else:
-                allocations[allocation]["models"].append("m_"+str(model))
+                allocations[allocation]["models"].append(model_name)
 
         models = {}
         for v in allocations.values():
@@ -170,41 +181,42 @@ class Allocations:
         if not 2 <= self.k <= len(df):
             raise ValueError("Expected-need allocation requires 2 <= k <= cohort size")
 
-        expected_needs = df[expected_need_column].astype(float)
-        if not np.isfinite(expected_needs).all() or (expected_needs < 0).any():
-            raise ValueError("Expected needs must be finite and nonnegative")
+        rounded_by_model = {}
+        for model_name in self._eligible_models(perf):
+            column = self.expected_need_column_for_model(model_name, expected_need_column)
+            if column not in df.columns:
+                raise ValueError(f"Missing expected-need column {column!r} for {model_name}")
+            expected_needs = df[column].astype(float)
+            if not np.isfinite(expected_needs).all() or (expected_needs < 0).any():
+                raise ValueError(f"Expected needs in {column!r} must be finite and nonnegative")
 
-        max_need = expected_needs.max()
-        if need_bound is None:
-            need_bound = max_need
-        if not np.isfinite(need_bound) or need_bound < max_need:
-            raise ValueError("need_bound must be finite and at least the largest expected need")
+            max_need = expected_needs.max()
+            model_bound = max_need if need_bound is None else need_bound
+            if not np.isfinite(model_bound) or model_bound < max_need:
+                raise ValueError(f"need_bound must be finite and at least the largest value in {column!r}")
 
-        if max_need == 0:
-            rounded_needs = pd.Series(0, index=df.index, dtype="int64")
-        else:
-            b = eta * need_bound / 2
-            if not np.isfinite(b) or b <= 0:
-                raise ValueError("eta and need_bound must give a finite, positive rounding step")
-            scaled_needs = expected_needs / b
-            if not np.isfinite(scaled_needs).all():
-                raise ValueError("eta is too small for integer DP need sums; increase eta")
-            rounded_needs = np.floor(scaled_needs).astype("int64")
+            if max_need == 0:
+                rounded_needs = pd.Series(0, index=df.index, dtype="int64")
+            else:
+                rounded_needs = np.floor(expected_needs).astype("int64")
+            rounded_by_model[model_name] = rounded_needs
 
         return self.calculate_least_discriminatory_allocation(
-            seed, iteration, df, perf, needs=rounded_needs,
+            seed, iteration, df, perf, needs_by_model=rounded_by_model,
         )
 
     def get_allocations(self, expected_need_column=None, eta=0.1, need_bound=None):
         allocations_opt = []
-        allocations_lda = []
+        allocations_lda_tru = []
+        allocations_lda_exp = []
         people = []
+        rng = np.random.default_rng(0)
         for split in range(self.NUM_SPLITS):
             split_df = self.df[(self.df["seed"]==split)&(self.df["person_id"]>=0)].copy()
             perf_df = self.df[(self.df["seed"]==split)&(self.df["person_id"]<0)].copy()
         
             for i in tqdm(range(self.ITERATIONS_PER_SPLIT), desc=f"[Split {split}]"):
-                k_0 = np.random.choice(range(1, self.TEST_SIZE))
+                k_0 = rng.choice(range(1, self.TEST_SIZE))
                 k_1 = self.TEST_SIZE - k_0
                 sample_0 = split_df[split_df[self.GROUP_COLUMN]==0].sample(n=k_0, random_state=i)
                 sample_1 = split_df[split_df[self.GROUP_COLUMN]==1].sample(n=k_1, random_state=i)
@@ -213,10 +225,9 @@ class Allocations:
                 people.append({"seed": split, "iteration": i, "people": people_sample["person_id"].to_list()})
                 
                 allocations_opt += self.calculate_rashomon_allocations(split, i, people_sample, perf_df)
-                if expected_need_column is None:
-                    allocations_lda += self.calculate_least_discriminatory_allocation(split, i, people_sample, perf_df)
-                else:
-                    allocations_lda += self.calculate_least_discriminatory_allocation_expected_needs(
+                allocations_lda_tru += self.calculate_least_discriminatory_allocation(split, i, people_sample, perf_df)
+                if expected_need_column is not None:
+                    allocations_lda_exp += self.calculate_least_discriminatory_allocation_expected_needs(
                         split, i, people_sample, perf_df,
                         expected_need_column=expected_need_column,
                         eta=eta,
@@ -224,5 +235,6 @@ class Allocations:
                     )
         people = pd.DataFrame(people)
         allocations_opt = pd.DataFrame(allocations_opt)
-        allocations_lda = pd.DataFrame(allocations_lda)
-        return allocations_opt, allocations_lda, people
+        allocations_lda_tru = pd.DataFrame(allocations_lda_tru)
+        allocations_lda_exp = pd.DataFrame(allocations_lda_exp)
+        return allocations_opt, allocations_lda_tru, allocations_lda_exp, people
