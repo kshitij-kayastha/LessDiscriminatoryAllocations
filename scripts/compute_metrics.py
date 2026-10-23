@@ -143,7 +143,9 @@ def run_config(people_fp, qual_column_cache):
             })
 
     out = pd.DataFrame(rows)
-    fp_out = ROOT / f"data/results/diversity_tru_need_{tag}.csv"
+    # the tag already carries the method, so no prefix is added here; for the
+    # true-needs runs the tag begins with "tru_need_" and the name is unchanged
+    fp_out = ROOT / f"data/results/diversity_{tag}.csv"
     out.to_csv(fp_out, index=False)
     return out
 
