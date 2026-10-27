@@ -1,0 +1,4 @@
+algorithm,source
+LDA-exp,"Experiment endpoint: beta=1, delta=1"
+LDA-tru,"Experiment endpoint: beta=0, delta=1"
+OPT,/Users/kk985/PhD/Research/LessDiscriminatoryAllocations/data/results/allocations/opt_bootstrap_nn_multiclass_average_y-qualified_gagne_1_rate-0.1_size-100.csv
