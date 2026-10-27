@@ -34,7 +34,6 @@ MODEL_CLASS = "nn_multiclass"
 NEED_COL = "gagne_sum_t"
 EXP_NEED_COL = "exp_need_{model}"
 GROUP_COL = "race"
-RASHOMON_EPS = 0.01
 ALLOCATION_EPS = 0.1
 ALGORITHMS = (("OPT", "opt"), ("LDA-tru", "lda_tru_need"), ("LDA-exp", "lda_exp_need"))
 
@@ -108,6 +107,7 @@ def comparison_rows(df, people, allocations, cohort_cols, k, args, tag):
                         "k": k,
                         "n_models": args.n_models,
                         "epsilon": ALLOCATION_EPS,
+                        "rashomon_eps": args.rashomon_eps,
                         "expected_utility": utility[offset],
                         "realized_utility": realized,
                         "absolute_disparity": abs(mean_1 - mean_0),
@@ -130,6 +130,10 @@ def main():
     ap.add_argument("--iters-per-seed", type=int, default=10)
     ap.add_argument("--n-models", type=int, default=1000)
     ap.add_argument("--n-jobs", type=int, default=-1)
+    # An absolute margin on validation loss, so it has to be recalibrated when
+    # the model class changes. At hidden_layer_sizes=(50, 100, 200) the losses
+    # span about 0.17, and 0.01 keeps only 4-14 of 1000 models per seed.
+    ap.add_argument("--rashomon-eps", type=float, default=0.01)
     ap.add_argument("--suffix", default="")
     ap.add_argument("--predictions", default=None,
                     help="override the input path; used to check the script at a tiny size")
@@ -138,7 +142,8 @@ def main():
     qualification_col = f"qualified_gagne_{args.need_threshold}"
     stem = f"test_{args.method}_{MODEL_CLASS}_{args.pred_method}_{qualification_col}"
     tag = (f"{stem}_rate-{args.selection_rate}_size-{args.sample_size}"
-           f"_iters-{args.iters_per_seed}_models-{args.n_models}{args.suffix}")
+           f"_iters-{args.iters_per_seed}_models-{args.n_models}"
+           f"_eps-{args.rashomon_eps}{args.suffix}")
 
     fp_predictions = (Path(args.predictions) if args.predictions
                       else ROOT / f"data/predictions/{stem}.csv")
@@ -153,7 +158,8 @@ def main():
     fp_comparison.parent.mkdir(parents=True, exist_ok=True)
 
     start = time.time()
-    print(f"[start] {tag}  n_jobs={args.n_jobs}", flush=True)
+    print(f"[start] {tag}  n_jobs={args.n_jobs}  rashomon_eps={args.rashomon_eps}",
+          flush=True)
 
     df, models, exp_needs = load_predictions(fp_predictions, args.n_models)
     race = pd.read_csv(fp_input, usecols=["person_id", GROUP_COL])
@@ -166,7 +172,7 @@ def main():
     a = Allocations(
         df=df, sample_size=args.sample_size, selection_rate=args.selection_rate,
         qualification_col="y", need_col=NEED_COL, group_col=GROUP_COL,
-        rashomon_eps=RASHOMON_EPS, allocation_eps=ALLOCATION_EPS,
+        rashomon_eps=args.rashomon_eps, allocation_eps=ALLOCATION_EPS,
         n_models=args.n_models, iters_per_seed=args.iters_per_seed,
         n_jobs=args.n_jobs, show_progress=True,
     )
