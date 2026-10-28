@@ -129,6 +129,93 @@ def collect(pred_method, size, iters, n_models, eps):
     return pd.DataFrame(sd_rows), pd.DataFrame(balance_rows)
 
 
+# The summary table test/03-results_exp_needs_multiclass.ipynb prints in its
+# last cell: mean +/- std per algorithm, the allocation columns taken over
+# every model row and the cohort columns over cohorts.
+NOTEBOOK_ALLOCATION_COLUMNS = ("realized_utility", "expected_utility",
+                               "absolute_disparity", "disparity_ratio", "k_0", "k_1")
+NOTEBOOK_COHORT_COLUMNS = ("pairwise_consistency", "systemic_exclusion_all",
+                           "systemic_exclusion_qualified")
+NOTEBOOK_HEADERS = {
+    "realized_utility": "real_util", "expected_utility": "exp_util",
+    "absolute_disparity": "abs_disp", "disparity_ratio": "disp_ratio",
+    "k_0": "k_0", "k_1": "k_1",
+    "pairwise_consistency": "pair_consist", "systemic_exclusion_all": "sys_excl_all",
+    "systemic_exclusion_qualified": "sys_excl_qual",
+}
+DIVERSITY_ALGORITHMS = {"OPT": "OPT", "LDA-tru": "LDA_TRU", "LDA-exp": "LDA_EXP"}
+
+
+def notebook_summary(pred_method, size, iters, n_models, eps, decimals=2):
+    """Rebuild the notebook's summary table from the run_allocations.py outputs."""
+    rows = []
+    for threshold in THRESHOLDS:
+        for rate in RATES:
+            stem = _stem(pred_method, threshold, rate, size, iters, n_models, eps)
+            fp_c = ROOT / f"data/results/comparison_{stem}.csv"
+            fp_d = ROOT / f"data/results/diagnostics_{stem}.csv"
+            fp_v = ROOT / f"data/results/diversity_{stem}.csv"
+            if not fp_c.exists():
+                continue
+            comparison = pd.read_csv(fp_c, usecols=[
+                "algorithm", "seed", "iteration", "model", "k",
+                "expected_utility", "realized_utility",
+                "absolute_disparity", "disparity_ratio"])
+            if fp_d.exists():
+                diag = pd.read_csv(fp_d, usecols=["seed", "iteration", "model", "algorithm",
+                                                  "selected_count_0", "selected_count_1"])
+                comparison = comparison.merge(
+                    diag.rename(columns={"selected_count_0": "k_0", "selected_count_1": "k_1"}),
+                    on=["seed", "iteration", "model", "algorithm"], how="left")
+            cohort = pd.read_csv(fp_v) if fp_v.exists() else None
+
+            for algorithm in ALGORITHMS:
+                grp = comparison[comparison["algorithm"] == algorithm]
+                if grp.empty:
+                    continue
+                row = {"need_threshold": threshold, "selection_rate": float(rate),
+                       "k": int(grp["k"].iloc[0]), "n": size,
+                       "pred_variant": pred_method, "algorithm": algorithm}
+                for column in NOTEBOOK_ALLOCATION_COLUMNS:
+                    if column in grp:
+                        row[column] = (grp[column].mean(), grp[column].std())
+                if cohort is not None:
+                    c = cohort[cohort["algorithm"] == DIVERSITY_ALGORITHMS[algorithm]]
+                    for column in NOTEBOOK_COHORT_COLUMNS:
+                        if column in c:
+                            row[column] = (c[column].mean(), c[column].std())
+                rows.append(row)
+    return pd.DataFrame(rows), decimals
+
+
+def notebook_text(summary, decimals=2, split=True):
+    """The notebook summary as monospace blocks narrow enough to paste."""
+    def render(columns, title):
+        keep = [c for c in columns if c in summary]
+        if not keep:
+            return ""
+        ordered = summary.sort_values(["need_threshold", "selection_rate", "algorithm"])
+        body = []
+        for _, r in ordered.iterrows():
+            body.append([f"{r[c][0]:.{decimals}f} ± {r[c][1]:.{decimals}f}" for c in keep])
+        # One width per column, so a wide count column does not pad the rest.
+        widths = [max(len(NOTEBOOK_HEADERS[c]), max(len(row[i]) for row in body)) + 2
+                  for i, c in enumerate(keep)]
+        head = f"{'thr':<4}{'rate':<6}{'algorithm':<10}" + "".join(
+            f"{NOTEBOOK_HEADERS[c]:>{w}}" for c, w in zip(keep, widths))
+        out = [title, "", head, "-" * len(head)]
+        for (_, r), cells in zip(ordered.iterrows(), body):
+            out.append(f"{int(r.need_threshold):<4}{r.selection_rate:<6}{r.algorithm:<10}"
+                       + "".join(f"{c:>{w}}" for c, w in zip(cells, widths)))
+        return "\n".join(out)
+
+    if split:
+        blocks = [render(NOTEBOOK_ALLOCATION_COLUMNS, "Allocation metrics (mean +/- std over models)"),
+                  render(NOTEBOOK_COHORT_COLUMNS, "Cohort metrics (mean +/- std over cohorts)")]
+        return "\n\n\n".join(b for b in blocks if b)
+    return render(NOTEBOOK_ALLOCATION_COLUMNS + NOTEBOOK_COHORT_COLUMNS, "Summary")
+
+
 def text_table(sd, brackets=True):
     """The results as a monospace table, ready to paste into a Slack code block."""
     sd = sd[sd.pred_method == "average"]
@@ -358,7 +445,23 @@ def main():
                     help="print the results table and exit, without rewriting the CSVs")
     ap.add_argument("--no-brackets", action="store_true",
                     help="with --text, leave out the within-cohort sd (57 chars instead of 78)")
+    ap.add_argument("--notebook", action="store_true",
+                    help="print the summary table from 03-results_exp_needs_multiclass.ipynb")
+    ap.add_argument("--one-block", action="store_true",
+                    help="with --notebook, one wide table instead of two narrower ones")
+    ap.add_argument("--decimals", type=int, default=2,
+                    help="with --notebook, decimal places (the notebook uses 2)")
     args = ap.parse_args()
+
+    if args.notebook:
+        method = "average" if args.pred_method == "both" else args.pred_method
+        summary, decimals = notebook_summary(method, args.sample_size, args.iters_per_seed,
+                                             args.n_models, args.rashomon_eps,
+                                             decimals=args.decimals)
+        if summary.empty:
+            raise SystemExit("no comparison files matched; check --n-models and --rashomon-eps")
+        print(notebook_text(summary, decimals=decimals, split=not args.one_block))
+        return
 
     fp_cached = ROOT / "data/results/disparity_sd_decomposition.csv"
     if args.text and fp_cached.exists():
