@@ -129,6 +129,27 @@ def collect(pred_method, size, iters, n_models, eps):
     return pd.DataFrame(sd_rows), pd.DataFrame(balance_rows)
 
 
+def text_table(sd, brackets=True):
+    """The results as a monospace table, ready to paste into a Slack code block."""
+    sd = sd[sd.pred_method == "average"]
+    if brackets:
+        head = ("thr  rate          OPT                  LDA-tru                LDA-exp\n"
+                "---  ----  ---------------------  ---------------------  ---------------------")
+        width, cell = 21, (lambda r: f"{r['mean']:.3f} ± {r.sd_pooled:.3f} "
+                                     f"({r.sd_within_cohort:.3f})")
+    else:
+        head = ("thr  rate        OPT            LDA-tru          LDA-exp\n"
+                "---  ----  --------------  --------------  --------------")
+        width, cell = 14, (lambda r: f"{r['mean']:.3f} ± {r.sd_pooled:.3f}")
+
+    lines = head.split("\n")
+    for (threshold, rate), grp in sd.groupby(["need_threshold", "selection_rate"], sort=True):
+        cells = [cell(grp[grp.algorithm == a].iloc[0]) for a in ALGORITHMS]
+        lines.append(f" {int(threshold)}   {str(rate):<4}  "
+                     + "  ".join(f"{c:<{width}}" for c in cells))
+    return "\n".join(line.rstrip() for line in lines)
+
+
 def _style(tb, hl=None, head="#33415a"):
     for (r, col), cell in tb.get_celld().items():
         cell.set_edgecolor("#d8d8d8")
@@ -333,7 +354,16 @@ def main():
     ap.add_argument("--n-models", type=int, default=1000)
     ap.add_argument("--rashomon-eps", default="0.01")
     ap.add_argument("--png", action="store_true", help="also render the summary table")
+    ap.add_argument("--text", action="store_true",
+                    help="print the results table and exit, without rewriting the CSVs")
+    ap.add_argument("--no-brackets", action="store_true",
+                    help="with --text, leave out the within-cohort sd (57 chars instead of 78)")
     args = ap.parse_args()
+
+    fp_cached = ROOT / "data/results/disparity_sd_decomposition.csv"
+    if args.text and fp_cached.exists():
+        print(text_table(pd.read_csv(fp_cached), brackets=not args.no_brackets))
+        return
 
     methods = ("average", "argmax") if args.pred_method == "both" else (args.pred_method,)
     sd_all, balance_all = [], []
@@ -355,6 +385,11 @@ def main():
     balance.round(6).to_csv(fp_bal, index=False)
     print(f"  wrote {fp_sd.name}  rows={len(sd)}")
     print(f"  wrote {fp_bal.name}  rows={len(balance)}")
+
+    if args.text:
+        print()
+        print(text_table(sd, brackets=not args.no_brackets))
+        return
 
     if args.png:
         share = out.parent / "share"
