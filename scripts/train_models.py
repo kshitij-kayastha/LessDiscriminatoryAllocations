@@ -68,8 +68,11 @@ def validate_needs(values, bound):
 class MulticlassNeedMLP(MLPClassifier):
     def __init__(self, need_bound, random_state=None, max_iter=1000):
         self.need_bound = need_bound
-        super().__init__(hidden_layer_sizes=(50, 100, 200),
-                         random_state=random_state, max_iter=max_iter)
+        # No hidden_layer_sizes: sklearn's default is (100,). The larger
+        # (50, 100, 200) network did not lower validation loss, and it widened
+        # the spread of those losses from about 0.008 to about 0.17, which left
+        # a Rashomon set of 4-15 models out of 1000 at eps = 0.01.
+        super().__init__(random_state=random_state, max_iter=max_iter)
 
     def _validate_input(self, X, y, incremental, reset):
         # Retain sklearn's input validation; replace only the target encoding.
