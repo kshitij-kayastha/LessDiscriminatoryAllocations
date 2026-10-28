@@ -129,6 +129,78 @@ def collect(pred_method, size, iters, n_models, eps):
     return pd.DataFrame(sd_rows), pd.DataFrame(balance_rows)
 
 
+def _style(tb, hl=None, head="#33415a"):
+    for (r, col), cell in tb.get_celld().items():
+        cell.set_edgecolor("#d8d8d8")
+        cell.set_linewidth(.6)
+        if r == 0:
+            cell.set_facecolor(head)
+            cell.set_text_props(color="white", weight="bold")
+            cell.set_height(cell.get_height() * 1.25)
+        else:
+            cell.set_facecolor("#ffffff" if r % 2 else "#f5f6f8")
+            if hl and col in hl:
+                cell.set_facecolor("#eef4ec" if r % 2 else "#e4ede1")
+        if col < 2:
+            cell.set_text_props(weight="bold" if col == 0 else "normal")
+
+
+def write_simple_png(sd, fp_png):
+    """The headline table: mean +/- sd per algorithm, all three thresholds."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    sd = sd[sd.pred_method == "average"]
+    fig = plt.figure(figsize=(12.6, 5.45), dpi=170)
+    fig.patch.set_facecolor("white")
+    fig.text(.5, .955, "Absolute disparity, bootstrap, 1000 models, (100,) network",
+             ha="center", size=15.5, weight="bold")
+    fig.text(.5, .905,
+             "mean +/- sd over 5 seeds x 10 cohorts x ~995 Rashomon models   |   "
+             "(within) = sd across models inside one cohort",
+             ha="center", size=10, color="#555")
+
+    cols = ["thr", "rate"]
+    for algorithm in ALGORITHMS:
+        cols += [f"{algorithm}", f"{algorithm}\n(within)"]
+    cells = []
+    for keys, grp in sd.groupby(["need_threshold", "selection_rate"], sort=True):
+        row = [int(keys[0]), keys[1]]
+        for algorithm in ALGORITHMS:
+            a = grp[grp.algorithm == algorithm].iloc[0]
+            row += [f"{a['mean']:.3f}  ± {a.sd_pooled:.3f}",
+                    f"{a.sd_within_cohort:.3f}"]
+        cells.append(row)
+
+    ax = fig.add_axes([.03, .40, .94, .44])
+    ax.axis("off")
+    tb = ax.table(cellText=cells, colLabels=cols, cellLoc="center",
+                  loc="upper center",
+                  colWidths=[.052, .058] + [.168, .082] * 3)
+    tb.auto_set_font_size(False)
+    tb.set_fontsize(10.4)
+    tb.scale(1, 1.62)
+    _style(tb, hl=[7])
+
+    fig.canvas.draw()
+    bb = tb.get_window_extent(fig.canvas.get_renderer()).transformed(
+        fig.transFigure.inverted())
+    fig.text(.03, bb.y0 - .035,
+             "Most of the pooled sd is variation between cohorts, not between models. The (within) "
+             "columns hold the cohort fixed and vary\n"
+             "the model across the Rashomon set, so those are the multiplicity. For LDA-tru it is near "
+             "zero everywhere: given a cohort, all\n"
+             "~995 models produce almost the same disparity.\n\n"
+             "Top-k selects nobody from one group in 20.1% of rows at rate 0.1, where the disparity is "
+             "undefined and those rows drop out of\n"
+             "OPT's mean. The DP always keeps both groups represented, so OPT and the DP are not "
+             "averaged over the same allocations.",
+             size=9.5, color="#444", va="top")
+    fig.savefig(fp_png, bbox_inches="tight", facecolor="white")
+    print(f"  wrote {fp_png.name}")
+
+
 def write_png(sd, balance, comp, fp_png):
     import matplotlib
     matplotlib.use("Agg")
@@ -285,9 +357,12 @@ def main():
     print(f"  wrote {fp_bal.name}  rows={len(balance)}")
 
     if args.png:
+        share = out.parent / "share"
+        share.mkdir(parents=True, exist_ok=True)
+        write_simple_png(sd, share / "results_table_net100.png")
         write_png(sd, balance, cohort_composition(iters=args.iters_per_seed,
                                                   sample_size=args.sample_size),
-                  out.parent / "share/disparity_table_net100.png")
+                  share / "disparity_table_net100.png")
 
 
 if __name__ == "__main__":
