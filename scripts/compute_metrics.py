@@ -106,8 +106,13 @@ def run_config(people_fp, qual_column_cache):
         print(f"  skip {tag}: found only {sorted(found)}", flush=True)
         return None
 
-    qual = re.search(r"y-(qualified_gagne_\d)", tag).group(1)
-    method = re.search(r"(test_bootstrap[a-z_]*?nn)_y-", tag).group(1)
+    # train_models.py drops the "y-" that the older notebooks put in front of
+    # the qualification column, so accept the tag either way.
+    stem = re.search(r"(test_bootstrap[a-z_0-9]*?)_(?:y-)?(qualified_gagne_\d)", tag)
+    if stem is None:
+        print(f"  skip {tag}: cannot read the method and qualification column")
+        return None
+    method, qual = stem.group(1), stem.group(2)
     key = (method, qual)
     if key not in qual_column_cache:
         pred = pd.read_csv(ROOT / f"data/predictions/{method}_{qual}.csv",
