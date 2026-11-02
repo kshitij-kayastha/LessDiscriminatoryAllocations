@@ -7,9 +7,13 @@ its parallelism, cohort sampler and bookkeeping are reused unchanged, and the
 within-cohort / between-cohort split of the sd comes out as it does for the
 Rashomon runs. Qualification probabilities are held fixed at each split's
 best-validation-loss model, so the only thing that varies is the needs.
+With --probs-models M the M lowest-validation-loss models of each split each
+supply their own probabilities, and every model gets the same D perturbation
+draws, so the sd across models isolates the effect of the probabilities.
 
 OPT and LDA-tru do not depend on (q, r); they are run once per selection rate
-with the same fixed probabilities and written as reference rows.
+with the same fixed probabilities (one allocation per model) and written as
+reference rows.
 
     uv run python scripts/run_perturbation_sweep.py --sample-size 250 \
         --selection-rate 0.05 0.1 0.2 0.3 0.4 0.5 --iters-per-seed 100 --n-draws 25
@@ -91,20 +95,24 @@ class SweepAllocations(Allocations):
                          pd.DataFrame(people, columns=["seed", "iteration", "people"]),)
 
 
-def load_reference(fp, n_models):
-    """Each split's best-validation-loss model supplies the fixed probabilities."""
+def load_reference(fp, n_models, n_probs=1):
+    """Each split's n_probs lowest-validation-loss models supply the probabilities,
+    as columns p_1 (the best) .. p_{n_probs}; p_ref is an alias of p_1."""
     models = [f"m_{i}" for i in range(1, n_models + 1)]
     df = pd.read_csv(fp, usecols=models + ["y", "person_id", NEED_COL, "seed"],
                      dtype={m: "float32" for m in models})
-    p_ref = pd.Series(np.nan, index=df.index, dtype="float32")
+    probs = {j: pd.Series(np.nan, index=df.index, dtype="float32")
+             for j in range(1, n_probs + 1)}
     chosen = {}
     for seed, split in df.groupby("seed"):
-        losses = split.loc[split["person_id"] == -1, models].iloc[0].astype(float)
-        best = losses.idxmin()
-        chosen[int(seed)] = (best, float(losses[best]))
-        p_ref.loc[split.index] = split[best]
+        losses = split.loc[split["person_id"] == -1, models].iloc[0].astype(float).sort_values()
+        chosen[int(seed)] = [(m, float(losses[m])) for m in losses.index[:n_probs]]
+        for j, (m, _) in enumerate(chosen[int(seed)], 1):
+            probs[j].loc[split.index] = split[m]
     out = df[["y", "person_id", NEED_COL, "seed"]].copy()
-    out["p_ref"] = p_ref
+    for j in range(1, n_probs + 1):
+        out[f"p_{j}"] = probs[j]
+    out["p_ref"] = out["p_1"]
     return out, chosen
 
 
@@ -116,24 +124,35 @@ def perturb(needs, q, r, rng):
     return np.clip(needs + np.where(move, step, 0), 0, NEED_MAX)
 
 
-def model_frame(base, n_draws, q=None, r=None):
-    """base plus m_1..m_D (all the fixed probabilities) and, for a sweep point,
-    exp_need_m_1..exp_need_m_D holding one perturbation draw each."""
+def model_frame(base, n_draws, q=None, r=None, n_probs=1):
+    """base plus one model column per (probability model j, draw d), numbered
+    m_{(j-1)*D + d}: the probabilities of p_j and, for a sweep point,
+    exp_need_m_... holding perturbation draw d. Draw d is the same vector for
+    every j, so the models differ only in their probabilities."""
     pop = (base["person_id"] >= 0).to_numpy()
     needs = base.loc[pop, NEED_COL].to_numpy(dtype=np.int64)
-    columns = {f"m_{d}": base["p_ref"] for d in range(1, n_draws + 1)}
+    draws = {}
     if q is not None:
         for d in range(1, n_draws + 1):
             rng = np.random.default_rng([SEED_BASE, d, int(round(q * 1000)), int(r)])
             col = np.full(len(base), np.nan)
             col[pop] = perturb(needs, q, r, rng)
-            columns[f"exp_need_m_{d}"] = col
+            draws[d] = col
+    columns = {}
+    for j in range(1, n_probs + 1):
+        for d in range(1, n_draws + 1):
+            idx = (j - 1) * n_draws + d
+            columns[f"m_{idx}"] = base[f"p_{j}"]
+            if q is not None:
+                columns[f"exp_need_m_{idx}"] = draws[d]
     return pd.concat([base, pd.DataFrame(columns, index=base.index)], axis=1)
 
 
-def metric_rows(frame, people, table, algorithm, k, common):
-    """One row per (cohort, draw): disparity on true needs, counts, utilities,
-    and the RMSE of the needs the DP was given, measured on the cohort."""
+def metric_rows(frame, people, table, algorithm, k, common, n_draws=1):
+    """One row per (cohort, model, draw): disparity on true needs, counts,
+    utilities, and the RMSE of the needs the DP was given, measured on the
+    cohort. Column m_idx maps back to model j = (idx-1)//n_draws + 1 and
+    draw d = (idx-1) % n_draws + 1."""
     rows = []
     splits = {seed: frame.loc[(frame["seed"] == seed) & (frame["person_id"] >= 0)]
                         .set_index("person_id")
@@ -152,16 +171,17 @@ def metric_rows(frame, people, table, algorithm, k, common):
             disparity = (abs(sel.loc[g == 1, NEED_COL].mean() - sel.loc[g == 0, NEED_COL].mean())
                          if n0 and n1 else np.nan)
             for model in allocation["models"]:
-                draw = int(model.split("_")[1])
+                idx = int(model.split("_")[1])
+                j, draw = (idx - 1) // n_draws + 1, (idx - 1) % n_draws + 1
                 rmse = np.nan
                 if algorithm == "LDA-exp":
                     given = cohort[f"exp_need_{model}"].to_numpy(dtype=np.float64)
                     rmse = float(np.sqrt(np.mean((given - need) ** 2)))
                 rows.append({
-                    **common, "algorithm": algorithm, "draw": draw,
+                    **common, "algorithm": algorithm, "model": j, "draw": draw,
                     "seed": seed, "iteration": iteration, "k": k,
                     "absolute_disparity": disparity, "k_0": n0, "k_1": n1,
-                    "expected_utility": float(sel["p_ref"].mean()),
+                    "expected_utility": float(sel[f"p_{j}"].mean()),
                     "realized_utility": float(sel["y"].mean()),
                     "cohort_rmse": rmse, "cohort_minority": minority,
                 })
@@ -174,12 +194,16 @@ def summary(df):
     out = []
     for (alg, q, r), g in df.groupby(["algorithm", "q", "r"], dropna=False, sort=False):
         per_cohort = g.groupby(["seed", "iteration"])["absolute_disparity"]
+        per_model = g.groupby("model")["absolute_disparity"].mean()
+        per_draw = g.groupby("draw")["absolute_disparity"].mean()
         out.append({
             "algorithm": alg, "q": q, "r": r,
             "rmse": g["cohort_rmse"].mean(),
             "mean": g["absolute_disparity"].mean(),
             "sd_within": per_cohort.std().mean(),
             "sd_between": per_cohort.mean().std(),
+            "sd_models": per_model.std() if len(per_model) > 1 else np.nan,
+            "sd_draws": per_draw.std() if len(per_draw) > 1 else np.nan,
             "pct_undefined": 100 * g["absolute_disparity"].isna().mean(),
         })
     return pd.DataFrame(out)
@@ -198,6 +222,8 @@ def main():
     ap.add_argument("--pred-method", default="average", choices=["average", "argmax"])
     ap.add_argument("--n-models", type=int, default=1000,
                     help="models in the prediction file to choose the reference from")
+    ap.add_argument("--probs-models", type=int, default=1,
+                    help="lowest-validation-loss models per split whose probabilities are used")
     ap.add_argument("--n-jobs", type=int, default=-1)
     ap.add_argument("--out-dir", default="data/results/perturbation")
     args = ap.parse_args()
@@ -205,14 +231,19 @@ def main():
     start = time.time()
     fp = ROOT / ("data/predictions/"
                  f"test_bootstrap_{MODEL_CLASS}_{args.pred_method}_qualified_gagne_{args.need_threshold}.csv")
-    base, chosen = load_reference(fp, args.n_models)
+    base, chosen = load_reference(fp, args.n_models, args.probs_models)
     race = pd.read_csv(ROOT / "data/obermeyer/obermeyer_data_cleaned.csv", usecols=["person_id", GROUP_COL])
     base = base.merge(race, on="person_id", how="left")
     base[GROUP_COL] = base[GROUP_COL].fillna(0).astype(int)
     print(f"[start] size={args.sample_size} rates={args.selection_rate} iters={args.iters_per_seed} "
-          f"draws={args.n_draws} q={args.q} r={args.r} split={args.group_split}", flush=True)
+          f"draws={args.n_draws} q={args.q} r={args.r} split={args.group_split} "
+          f"probs_models={args.probs_models}", flush=True)
     print("  reference model per split: " +
-          ", ".join(f"seed {s}: {m} (val loss {l:.4f})" for s, (m, l) in chosen.items()), flush=True)
+          ", ".join(f"seed {s}: {ms[0][0]} (val loss {ms[0][1]:.4f})" for s, ms in chosen.items()), flush=True)
+    if args.probs_models > 1:
+        print("  probability models per split: " +
+              "; ".join(f"seed {s}: " + " ".join(m for m, _ in ms) for s, ms in chosen.items()), flush=True)
+    M = args.probs_models
 
     out_dir = ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -229,9 +260,10 @@ def main():
         t_rate = time.time()
         common = {"sample_size": args.sample_size, "selection_rate": rate,
                   "iters_per_seed": args.iters_per_seed, "group_split": args.group_split,
+                  "probs_models": M,
                   "need_threshold": args.need_threshold, "pred_method": args.pred_method}
-        ref_frame = model_frame(base, 1)
-        a = allocator(ref_frame, rate, 1)
+        ref_frame = model_frame(base, 1, n_probs=M)
+        a = allocator(ref_frame, rate, M)
         opt, tru, _, people = a.get_allocations(algorithms=["OPT", "LDA-tru"])
         rows = (metric_rows(ref_frame, people, opt, "OPT", a.k, {**common, "q": np.nan, "r": np.nan})
                 + metric_rows(ref_frame, people, tru, "LDA-tru", a.k, {**common, "q": np.nan, "r": np.nan}))
@@ -241,19 +273,21 @@ def main():
         for q in args.q:
             for r in args.r:
                 t0 = time.time()
-                frame = model_frame(base, args.n_draws, q, r)
-                a = allocator(frame, rate, args.n_draws)
+                frame = model_frame(base, args.n_draws, q, r, n_probs=M)
+                a = allocator(frame, rate, M * args.n_draws)
                 _, _, exp, people_qr = a.get_allocations(exp_need_col="exp_need_{model}",
                                                          algorithms=["LDA-exp"])
                 if not people_qr["people"].equals(people["people"]):
                     sys.exit("cohorts differ between the reference run and a sweep point")
-                rows += metric_rows(frame, people_qr, exp, "LDA-exp", a.k, {**common, "q": q, "r": r})
+                rows += metric_rows(frame, people_qr, exp, "LDA-exp", a.k, {**common, "q": q, "r": r},
+                                    n_draws=args.n_draws)
                 print(f"    q={q} r={r}: {(time.time()-t0)/60:.1f} min", flush=True)
 
         df = pd.DataFrame(rows)
         tag = (f"size-{args.sample_size}_rate-{rate}_iters-{args.iters_per_seed}"
                f"_draws-{args.n_draws}_split-{args.group_split}"
-               f"_{args.pred_method}_gagne_{args.need_threshold}")
+               + (f"_probs-{M}" if M > 1 else "")
+               + f"_{args.pred_method}_gagne_{args.need_threshold}")
         df.to_csv(out_dir / f"perturb_{tag}.csv", index=False)
         print(f"  wrote perturb_{tag}.csv ({len(df):,} rows)\n", flush=True)
         with pd.option_context("display.width", 120, "display.float_format", "{:.3f}".format):
