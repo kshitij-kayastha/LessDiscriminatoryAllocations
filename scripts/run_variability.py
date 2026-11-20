@@ -29,9 +29,10 @@ from run_perturbation_sweep import (  # noqa: E402
     ALLOCATION_EPS, GROUP_COL, MODEL_CLASS, NEED_COL, SweepAllocations, metric_rows)
 
 
-def load_top_models(fp, n_models, n_top):
+def load_top_models(fp, n_models, n_top, round_needs=True):
     """Columns p_j / m_j (probabilities) and exp_need_m_j (rounded predicted
-    need) for each split's n_top lowest-validation-loss models, j = 1..n_top."""
+    need, or the raw expected need with round_needs=False) for each split's
+    n_top lowest-validation-loss models, j = 1..n_top."""
     models = [f"m_{i}" for i in range(1, n_models + 1)]
     need_cols = [f"exp_need_{m}" for m in models]
     df = pd.read_csv(fp, usecols=models + need_cols + ["y", "person_id", NEED_COL, "seed"],
@@ -47,7 +48,8 @@ def load_top_models(fp, n_models, n_top):
             cols[f"p_{j}"] = split[m].astype("float32")
             cols[f"m_{j}"] = split[m].astype("float32")
             # the DP sees rounded needs; metric_rows measures RMSE on this column
-            cols[f"exp_need_m_{j}"] = np.rint(split[f"exp_need_{m}"].astype(np.float64))
+            raw = split[f"exp_need_{m}"].astype(np.float64)
+            cols[f"exp_need_m_{j}"] = np.rint(raw) if round_needs else raw
         parts.append(pd.concat([part, pd.DataFrame(cols, index=part.index)], axis=1))
     return pd.concat(parts).sort_index(), chosen
 
