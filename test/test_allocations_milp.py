@@ -52,8 +52,15 @@ def brute_force(groups, probabilities, needs, k, floor):
     return best
 
 
+SOLVERS = ("highs", "gurobi")
+
+
 class MilpTests(unittest.TestCase):
     def test_matches_dp_and_brute_force_on_integer_needs(self):
+        for solver in SOLVERS:
+            self._integer_needs(solver)
+
+    def _integer_needs(self, solver):
         rng = np.random.default_rng(0)
         for trial in range(40):
             n = int(rng.integers(6, 13))
@@ -61,10 +68,10 @@ class MilpTests(unittest.TestCase):
             eps = float(rng.choice([0.0, 0.1, 0.3]))
             groups, p, needs = random_cohort(rng, n)
             floor, top_k = floor_and_topk(p, k, eps)
-            with self.subTest(trial=trial, n=n, k=k, eps=eps):
+            with self.subTest(solver=solver, trial=trial, n=n, k=k, eps=eps):
                 dp_sel, fallback = _solve_dp(groups, p.tolist(), [int(v) for v in needs],
                                              k, floor, top_k)
-                milp_sel, info = solve_milp(groups, p, needs, k, floor)
+                milp_sel, info = solve_milp(groups, p, needs, k, floor, solver=solver)
                 if fallback:
                     # At eps = 0 the floor equals the top-k utility and the DP
                     # can reject the top-k set itself by ~1e-16 of summation
@@ -80,14 +87,18 @@ class MilpTests(unittest.TestCase):
                 self.assertAlmostEqual(info["utility"], u_dp, places=7)
 
     def test_fractional_needs_match_brute_force(self):
+        for solver in SOLVERS:
+            self._fractional_needs(solver)
+
+    def _fractional_needs(self, solver):
         rng = np.random.default_rng(1)
         for trial in range(20):
             n = int(rng.integers(6, 12))
             k = int(rng.integers(2, n))
             groups, p, needs = random_cohort(rng, n, integer_needs=False)
             floor, _ = floor_and_topk(p, k, 0.1)
-            with self.subTest(trial=trial, n=n, k=k):
-                milp_sel, info = solve_milp(groups, p, needs, k, floor)
+            with self.subTest(solver=solver, trial=trial, n=n, k=k):
+                milp_sel, info = solve_milp(groups, p, needs, k, floor, solver=solver)
                 d_bf, u_bf = brute_force(groups, p, needs, k, floor)
                 self.assertIsNotNone(milp_sel)
                 self.assertAlmostEqual(info["disparity"], d_bf, places=7)

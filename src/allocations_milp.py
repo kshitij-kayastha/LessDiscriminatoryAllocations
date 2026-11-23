@@ -1,8 +1,11 @@
 """Least-discriminatory allocation as a mixed-integer linear program.
 
 The DP in allocations_parallel.py needs integer needs and costs about k^2 per
-cohort. This module solves the same problem with a MILP solver (HiGHS through
-scipy.optimize.milp, no licence needed), which also accepts fractional needs.
+cohort. This module solves the same problem with a MILP solver, which also accepts
+fractional needs. Two backends: HiGHS through scipy.optimize.milp (no licence)
+and Gurobi through gurobipy (solver="gurobi"; the pip build carries a licence
+limited to 2000 variables, i.e. cohorts up to n = 1999, an academic licence
+lifts that).
 
 Formulation (LLDAV2 Section 5.6). For a fixed group split t (t from group 0,
 k - t from group 1), with binary z_i and a free variable d:
@@ -75,10 +78,62 @@ class _Failed:
     x, status = None, -1
 
 
-def _run(c, constraints, integrality, bounds, options):
+class _Result:
+    def __init__(self, x, status):
+        self.x, self.status = x, status
+
+
+_GUROBI_ENV = None
+
+
+def _gurobi_env():
+    global _GUROBI_ENV
+    if _GUROBI_ENV is None:
+        import gurobipy as gp
+        _GUROBI_ENV = gp.Env(params={"OutputFlag": 0})
+    return _GUROBI_ENV
+
+
+def _run_gurobi(c, constraints, integrality, bounds, options):
+    """Same problem through gurobipy. Status follows scipy's milp:
+    0 optimal, 1 time limit reached (incumbent returned), 2 infeasible."""
+    import gurobipy as gp
+    A = constraints.A.toarray() if hasattr(constraints.A, "toarray") else np.asarray(constraints.A)
+    n_var = A.shape[1]
+    m = gp.Model(env=_gurobi_env())
+    m.Params.Threads = 1
+    m.Params.MIPGap = 0.0
+    m.Params.MIPGapAbs = options.get("mip_abs_gap", 1e-10)
+    if "time_limit" in options:
+        m.Params.TimeLimit = options["time_limit"]
+    if "random_seed" in options:
+        m.Params.Seed = options["random_seed"]
+    vtype = np.where(np.asarray(integrality) > 0, gp.GRB.BINARY, gp.GRB.CONTINUOUS)
+    x = m.addMVar(n_var, lb=bounds.lb, ub=bounds.ub, vtype=vtype)
+    m.setObjective(np.asarray(c) @ x, gp.GRB.MINIMIZE)
+    lb, ub = np.asarray(constraints.lb, float), np.asarray(constraints.ub, float)
+    for i in range(A.shape[0]):
+        row = A[i] @ x
+        if lb[i] == ub[i]:
+            m.addConstr(row == lb[i])
+        else:
+            if np.isfinite(lb[i]):
+                m.addConstr(row >= lb[i])
+            if np.isfinite(ub[i]):
+                m.addConstr(row <= ub[i])
+    m.optimize()
+    if m.SolCount == 0:
+        return _Result(None, 2 if m.Status == gp.GRB.INFEASIBLE else -1)
+    status = 0 if m.Status == gp.GRB.OPTIMAL else 1
+    return _Result(np.array(x.X), status)
+
+
+def _run(c, constraints, integrality, bounds, options, solver="highs"):
     """milp with retries: this HiGHS build intermittently throws ValueError
     ('vector') mid-solve, mostly when a time limit interrupts it. Retry with
     presolve off and other random seeds; give the split up after that."""
+    if solver == "gurobi":
+        return _run_gurobi(c, constraints, integrality, bounds, options)
     attempts = [options, {**options, "presolve": False},
                 {**options, "random_seed": 1}, {**options, "random_seed": 2, "presolve": False}]
     for opts in attempts:
@@ -92,7 +147,7 @@ def _run(c, constraints, integrality, bounds, options):
 
 
 def _split_milp(groups, probabilities, needs, k, t, utility_requirement, *,
-                utility_weight=0.0, max_disparity=None, time_limit=None):
+                utility_weight=0.0, max_disparity=None, time_limit=None, solver="highs"):
     """Solve one split. Returns (status, selected, disparity, utility).
 
     utility_weight > 0 minimises d - weight * utility. With max_disparity set
@@ -125,7 +180,7 @@ def _split_milp(groups, probabilities, needs, k, t, utility_requirement, *,
         options["mip_abs_gap"] = 0.0
     if time_limit is not None:
         options["time_limit"] = time_limit
-    res = _run(c, constraints, integrality, bounds, options)
+    res = _run(c, constraints, integrality, bounds, options, solver)
     if res.x is None:
         return res.status, None, np.inf, 0.0
     z = res.x[:n] > 0.5
@@ -136,7 +191,8 @@ def _split_milp(groups, probabilities, needs, k, t, utility_requirement, *,
 
 
 def solve_milp(groups, probabilities, needs, k, utility_requirement, *,
-               tie_break="exact", min_gap=None, time_limit=None, tie_tol=None):
+               tie_break="exact", min_gap=None, time_limit=None, tie_tol=None,
+               solver="highs"):
     """Least-discriminatory allocation of k people under the utility floor.
 
     groups: two lists of row indices (group 0, group 1); probabilities and
@@ -147,8 +203,10 @@ def solve_milp(groups, probabilities, needs, k, utility_requirement, *,
     split count, solve time and the scipy status of the winning split;
     selected is None when no split is feasible (the DP's fallback case).
     tie_tol: disparities within this of the minimum count as tied (default
-    min(1e-4, 1/k^2)).
+    min(1e-4, 1/k^2)). solver: "highs" (scipy) or "gurobi" (gurobipy).
     """
+    if solver not in ("highs", "gurobi"):
+        raise ValueError("solver must be 'highs' or 'gurobi'")
     if tie_tol is None:
         tie_tol = min(_TIE_TOL, 1.0 / k**2)
     probabilities = np.asarray(probabilities, dtype=np.float64)
@@ -172,10 +230,11 @@ def solve_milp(groups, probabilities, needs, k, utility_requirement, *,
     for t in range(max(1, k - len(g1)), min(len(g0), k - 1) + 1):
         status, selected, disparity, utility = _split_milp(
             (g0, g1), probabilities, needs, k, t, utility_requirement,
-            utility_weight=weight, time_limit=time_limit)
+            utility_weight=weight, time_limit=time_limit, solver=solver)
         if selected is not None:
             results.append((disparity, utility, t, selected, status))
-    info = {"splits": len(results), "seconds": perf_counter() - started, "tie_break": tie_break}
+    info = {"splits": len(results), "seconds": perf_counter() - started,
+            "tie_break": tie_break, "solver": solver}
     if not results:
         return None, {**info, "disparity": np.inf, "utility": 0.0, "status": None}
     best = min(r[0] for r in results)
@@ -185,7 +244,7 @@ def solve_milp(groups, probabilities, needs, k, utility_requirement, *,
         for disparity, utility, t, selected, status in tied:
             status2, selected2, disparity2, utility2 = _split_milp(
                 (g0, g1), probabilities, needs, k, t, utility_requirement,
-                max_disparity=best + tie_tol, time_limit=time_limit)
+                max_disparity=best + tie_tol, time_limit=time_limit, solver=solver)
             improved.append((disparity2, utility2, t, selected2, status2) if selected2 is not None
                             else (disparity, utility, t, selected, status))
         tied = improved
